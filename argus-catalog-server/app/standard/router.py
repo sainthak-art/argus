@@ -2,23 +2,70 @@
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import get_session
 from app.standard import service
 from app.standard.schemas import (
-    AutoMapResult, CodeGroupCreate, CodeGroupResponse, CodeGroupUpdate,
-    CodeValueCreate, CodeValueResponse, ComplianceStats, DatasetTermMapping,
-    DictionaryCreate, DictionaryResponse, DictionaryUpdate, DomainCreate,
-    DomainResponse, DomainUpdate, MorphemeResult, TermCreate, TermMappingCreate,
-    TermMappingResponse, TermResponse, TermUpdate, WordCreate, WordResponse,
+    AutoMapResult,
+    BulkResult,
+    CodeGroupBulkRequest,
+    CodeGroupCreate,
+    CodeGroupResponse,
+    CodeGroupUpdate,
+    CodeValueCreate,
+    CodeValueResponse,
+    ComplianceStats,
+    DatasetTermMapping,
+    DictionaryCreate,
+    DictionaryResponse,
+    DictionaryUpdate,
+    DomainBulkRequest,
+    DomainCreate,
+    DomainResponse,
+    DomainUpdate,
+    MorphemeResult,
+    TermBulkRequest,
+    TermCreate,
+    TermMappingCreate,
+    TermMappingResponse,
+    TermResponse,
+    TermUpdate,
+    WordBulkRequest,
+    WordCreate,
+    WordResponse,
     WordUpdate,
 )
-from app.core.database import get_session
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/standards", tags=["standards"])
+
+
+# ---------------------------------------------------------------------------
+# Bulk file import (CSV/XLSX) — 표준 4종 일괄 적재
+# ---------------------------------------------------------------------------
+
+@router.post("/import-file", response_model=BulkResult, status_code=201)
+async def import_standards_file(
+    kind: str = Form(...),
+    dictionary_id: int = Form(...),
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+):
+    """CSV/XLSX 파일을 업로드해 kind(word|term|domain|code) 표준을 일괄 적재."""
+    if kind not in service.IMPORT_KINDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown kind '{kind}' (allowed: {sorted(service.IMPORT_KINDS)})",
+        )
+    content = await file.read()
+    result = await service.import_standards_file(
+        session, kind, dictionary_id, file.filename or "upload", content
+    )
+    await session.commit()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +119,13 @@ async def create_word(data: WordCreate, session: AsyncSession = Depends(get_sess
     return result
 
 
+@router.post("/words/bulk", response_model=BulkResult, status_code=201)
+async def bulk_create_words(data: WordBulkRequest, session: AsyncSession = Depends(get_session)):
+    result = await service.bulk_create_words(session, data.items)
+    await session.commit()
+    return result
+
+
 @router.get("/words", response_model=list[WordResponse])
 async def list_words(
     dictionary_id: int = Query(...),
@@ -116,6 +170,13 @@ async def create_domain(data: DomainCreate, session: AsyncSession = Depends(get_
     return result
 
 
+@router.post("/domains/bulk", response_model=BulkResult, status_code=201)
+async def bulk_create_domains(data: DomainBulkRequest, session: AsyncSession = Depends(get_session)):
+    result = await service.bulk_create_domains(session, data.items)
+    await session.commit()
+    return result
+
+
 @router.get("/domains", response_model=list[DomainResponse])
 async def list_domains(dictionary_id: int = Query(...), session: AsyncSession = Depends(get_session)):
     return await service.list_domains(session, dictionary_id)
@@ -152,6 +213,13 @@ async def delete_domain(domain_id: int, session: AsyncSession = Depends(get_sess
 @router.post("/code-groups", response_model=CodeGroupResponse, status_code=201)
 async def create_code_group(data: CodeGroupCreate, session: AsyncSession = Depends(get_session)):
     result = await service.create_code_group(session, data)
+    await session.commit()
+    return result
+
+
+@router.post("/code-groups/bulk", response_model=BulkResult, status_code=201)
+async def bulk_create_code_groups(data: CodeGroupBulkRequest, session: AsyncSession = Depends(get_session)):
+    result = await service.bulk_create_code_groups(session, data.items)
     await session.commit()
     return result
 
@@ -228,6 +296,13 @@ async def analyze_term(
 @router.post("/terms", response_model=TermResponse, status_code=201)
 async def create_term(data: TermCreate, session: AsyncSession = Depends(get_session)):
     result = await service.create_term(session, data)
+    await session.commit()
+    return result
+
+
+@router.post("/terms/bulk", response_model=BulkResult, status_code=201)
+async def bulk_create_terms(data: TermBulkRequest, session: AsyncSession = Depends(get_session)):
+    result = await service.bulk_create_terms(session, data.items)
     await session.commit()
     return result
 

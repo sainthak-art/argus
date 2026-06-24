@@ -9,20 +9,48 @@ import logging
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.catalog.models import Dataset, DatasetSchema
+from app.standard import file_import
 from app.standard.models import (
-    CodeGroup, CodeValue, StandardChangeLog, StandardDictionary,
-    StandardDomain, StandardTerm, StandardTermWord, StandardWord,
+    CodeGroup,
+    CodeValue,
+    StandardChangeLog,
+    StandardDictionary,
+    StandardDomain,
+    StandardTerm,
+    StandardTermWord,
+    StandardWord,
     TermColumnMapping,
 )
 from app.standard.schemas import (
-    AutoMapResult, CodeGroupCreate, CodeGroupResponse, CodeGroupUpdate,
-    CodeValueCreate, CodeValueResponse, ColumnTermStatus, ComplianceStats,
-    DatasetTermMapping, DictionaryCreate, DictionaryResponse, DictionaryUpdate,
-    DomainCreate, DomainResponse, DomainUpdate, MorphemeResult, TermCreate,
-    TermMappingCreate, TermMappingResponse, TermResponse, TermUpdate,
-    TermWordInfo, WordCreate, WordResponse, WordUpdate,
+    AutoMapResult,
+    BulkError,
+    BulkResult,
+    CodeGroupBulkItem,
+    CodeGroupCreate,
+    CodeGroupResponse,
+    CodeValueCreate,
+    CodeValueResponse,
+    ColumnTermStatus,
+    ComplianceStats,
+    DatasetTermMapping,
+    DictionaryCreate,
+    DictionaryResponse,
+    DictionaryUpdate,
+    DomainCreate,
+    DomainResponse,
+    DomainUpdate,
+    MorphemeResult,
+    TermCreate,
+    TermMappingCreate,
+    TermMappingResponse,
+    TermResponse,
+    TermUpdate,
+    TermWordInfo,
+    WordCreate,
+    WordResponse,
+    WordUpdate,
 )
-from app.catalog.models import Dataset, DatasetSchema
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +129,177 @@ async def create_word(session: AsyncSession, data: WordCreate) -> WordResponse:
     return WordResponse.model_validate(w)
 
 
+def _bulk_error_message(exc: Exception) -> str:
+    """Concise, DB-driver message for a failed bulk row."""
+    orig = getattr(exc, "orig", None)
+    return str(orig) if orig else str(exc)
+
+
+async def _bulk_create(session: AsyncSession, items: list, create_fn) -> BulkResult:
+    """Run ``create_fn`` per item inside its own SAVEPOINT.
+
+    A failed row rolls back only itself (partial success); valid rows persist
+    and each failure is reported with its input index.
+    """
+    ids: list[int] = []
+    errors: list[BulkError] = []
+    for index, item in enumerate(items):
+        try:
+            async with session.begin_nested():
+                obj = await create_fn(session, item)
+            ids.append(obj.id)
+        except Exception as exc:  # noqa: BLE001 - per-row isolation for bulk load
+            errors.append(BulkError(index=index, error=_bulk_error_message(exc)))
+    return BulkResult(total=len(items), created=len(ids), failed=len(errors),
+                      ids=ids, errors=errors)
+
+
+async def bulk_create_words(session: AsyncSession, items: list[WordCreate]) -> BulkResult:
+    return await _bulk_create(session, items, create_word)
+
+
+# ---------------------------------------------------------------------------
+# File import (CSV/XLSX) → 행 매핑 → 벌크 적재
+# ---------------------------------------------------------------------------
+
+IMPORT_KINDS = {"word", "term", "domain", "code"}
+
+# 컬럼 헤더 별칭(한/영) → 표준 필드. 첫 비어있지 않은 매칭값을 채택.
+_ALIASES = {
+    "word_name": ["단어명", "단어", "논리명", "word_name", "name"],
+    "word_english": ["영문명", "영문", "word_english", "english"],
+    "word_abbr": ["영문약어", "약어", "word_abbr", "abbr"],
+    "word_type": ["단어유형", "유형", "word_type", "type"],
+    "domain_name": ["도메인명", "도메인", "domain_name"],
+    "data_type": ["데이터유형", "데이터타입", "data_type", "type"],
+    "data_length": ["길이", "data_length", "length"],
+    "data_precision": ["정밀도", "data_precision", "precision"],
+    "data_scale": ["소수점", "스케일", "data_scale", "scale"],
+    "domain_group": ["도메인그룹명", "도메인그룹", "domain_group", "group"],
+    "term_name": ["용어명", "용어", "term_name"],
+    "term_english": ["영문명", "영문", "term_english", "english"],
+    "term_abbr": ["영문약어", "약어", "term_abbr", "abbr"],
+    "physical_name": ["물리명", "컬럼명", "physical_name", "physical"],
+    "group_name": ["코드그룹", "코드그룹명", "그룹명", "group_name"],
+    "group_english": ["그룹영문", "group_english"],
+    "code_value": ["코드값", "코드", "code_value", "value"],
+    "code_name": ["코드값명", "코드명", "code_name"],
+    "code_english": ["영문", "code_english"],
+    "sort_order": ["정렬순서", "순서", "sort_order"],
+    "description": ["설명", "비고", "description", "desc"],
+}
+
+
+def _pick(row: dict, field: str) -> str:
+    for alias in _ALIASES.get(field, [field]):
+        value = str(row.get(alias, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _to_int(value: str) -> int | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    try:
+        return int(float(value))
+    except ValueError:
+        return None
+
+
+def _rows_to_words(rows: list[dict], dictionary_id: int) -> list[WordCreate]:
+    items: list[WordCreate] = []
+    for r in rows:
+        name = _pick(r, "word_name")
+        if not name:
+            continue
+        eng = _pick(r, "word_english") or name
+        items.append(WordCreate(
+            dictionary_id=dictionary_id, word_name=name,
+            word_english=eng, word_abbr=_pick(r, "word_abbr") or eng,
+            description=_pick(r, "description") or None,
+            word_type=_pick(r, "word_type") or "GENERAL",
+        ))
+    return items
+
+
+def _rows_to_domains(rows: list[dict], dictionary_id: int) -> list[DomainCreate]:
+    items: list[DomainCreate] = []
+    for r in rows:
+        name = _pick(r, "domain_name")
+        if not name:
+            continue
+        items.append(DomainCreate(
+            dictionary_id=dictionary_id, domain_name=name,
+            data_type=_pick(r, "data_type") or "VARCHAR",
+            data_length=_to_int(_pick(r, "data_length")),
+            data_precision=_to_int(_pick(r, "data_precision")),
+            data_scale=_to_int(_pick(r, "data_scale")),
+            domain_group=_pick(r, "domain_group") or None,
+            description=_pick(r, "description") or None,
+        ))
+    return items
+
+
+def _rows_to_terms(rows: list[dict], dictionary_id: int) -> list[TermCreate]:
+    items: list[TermCreate] = []
+    for r in rows:
+        name = _pick(r, "term_name")
+        if not name:
+            continue
+        items.append(TermCreate(
+            dictionary_id=dictionary_id, term_name=name,
+            term_english=_pick(r, "term_english") or None,
+            term_abbr=_pick(r, "term_abbr") or None,
+            physical_name=_pick(r, "physical_name") or None,
+            description=_pick(r, "description") or None,
+        ))
+    return items
+
+
+def _rows_to_code_groups(rows: list[dict], dictionary_id: int) -> list[CodeGroupBulkItem]:
+    """코드사전 행을 코드그룹 단위로 묶는다. (group, code_value) 중복은 1회만."""
+    groups: dict[str, CodeGroupBulkItem] = {}
+    seen: dict[str, set] = {}
+    for r in rows:
+        gname = _pick(r, "group_name")
+        cval = _pick(r, "code_value")
+        cname = _pick(r, "code_name")
+        if not gname:
+            continue
+        if gname not in groups:
+            groups[gname] = CodeGroupBulkItem(
+                dictionary_id=dictionary_id, group_name=gname,
+                group_english=_pick(r, "group_english") or None, values=[],
+            )
+            seen[gname] = set()
+        if cval and cname and cval not in seen[gname]:
+            seen[gname].add(cval)
+            groups[gname].values.append(CodeValueCreate(
+                code_value=cval, code_name=cname,
+                code_english=_pick(r, "code_english") or None,
+                sort_order=_to_int(_pick(r, "sort_order")) or 0,
+            ))
+    return list(groups.values())
+
+
+async def import_standards_file(
+    session: AsyncSession, kind: str, dictionary_id: int, filename: str, content: bytes,
+) -> BulkResult:
+    """CSV/XLSX 파일을 파싱해 kind 별 벌크 적재 서비스로 위임."""
+    rows = file_import.parse_table(filename, content)
+    if kind == "word":
+        return await bulk_create_words(session, _rows_to_words(rows, dictionary_id))
+    if kind == "domain":
+        return await bulk_create_domains(session, _rows_to_domains(rows, dictionary_id))
+    if kind == "term":
+        return await bulk_create_terms(session, _rows_to_terms(rows, dictionary_id))
+    if kind == "code":
+        return await bulk_create_code_groups(session, _rows_to_code_groups(rows, dictionary_id))
+    raise ValueError(f"unknown kind '{kind}' (allowed: {sorted(IMPORT_KINDS)})")
+
+
 async def list_words(session: AsyncSession, dictionary_id: int, word_type: str | None = None) -> list[WordResponse]:
     stmt = select(StandardWord).where(StandardWord.dictionary_id == dictionary_id)
     if word_type:
@@ -150,6 +349,10 @@ async def create_domain(session: AsyncSession, data: DomainCreate) -> DomainResp
     await _log_change(session, "DOMAIN", d.id, "CREATE")
     logger.info("Standard domain created: id=%d, name=%s, type=%s", d.id, d.domain_name, d.data_type)
     return await _build_domain_response(session, d)
+
+
+async def bulk_create_domains(session: AsyncSession, items: list[DomainCreate]) -> BulkResult:
+    return await _bulk_create(session, items, create_domain)
 
 
 async def list_domains(session: AsyncSession, dictionary_id: int) -> list[DomainResponse]:
@@ -213,6 +416,18 @@ async def create_code_group(session: AsyncSession, data: CodeGroupCreate) -> Cod
     await session.refresh(cg)
     await _log_change(session, "CODE_GROUP", cg.id, "CREATE")
     return await _build_code_group_response(session, cg)
+
+
+async def _create_code_group_with_values(session: AsyncSession, item: CodeGroupBulkItem) -> CodeGroupResponse:
+    """Create a code group and its nested code values atomically (within caller's savepoint)."""
+    cg = await create_code_group(session, CodeGroupCreate(**item.model_dump(exclude={"values"})))
+    for value in item.values:
+        await add_code_value(session, cg.id, value)
+    return cg
+
+
+async def bulk_create_code_groups(session: AsyncSession, items: list[CodeGroupBulkItem]) -> BulkResult:
+    return await _bulk_create(session, items, _create_code_group_with_values)
 
 
 async def list_code_groups(session: AsyncSession, dictionary_id: int) -> list[CodeGroupResponse]:
@@ -405,6 +620,10 @@ async def create_term(session: AsyncSession, data: TermCreate) -> TermResponse:
     await _log_change(session, "TERM", t.id, "CREATE")
     logger.info("Standard term created: id=%d, name=%s, physical=%s", t.id, t.term_name, t.physical_name)
     return await _build_term_response(session, t)
+
+
+async def bulk_create_terms(session: AsyncSession, items: list[TermCreate]) -> BulkResult:
+    return await _bulk_create(session, items, create_term)
 
 
 async def list_terms(session: AsyncSession, dictionary_id: int, search: str | None = None) -> list[TermResponse]:

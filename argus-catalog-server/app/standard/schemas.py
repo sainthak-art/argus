@@ -4,7 +4,6 @@ from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
-
 # ---------------------------------------------------------------------------
 # Dictionary
 # ---------------------------------------------------------------------------
@@ -59,6 +58,10 @@ class WordCreate(BaseModel):
     synonym_group_id: int | None = None
 
 
+class WordBulkRequest(BaseModel):
+    items: list["WordCreate"]
+
+
 class WordUpdate(BaseModel):
     word_name: str | None = None
     word_english: str | None = None
@@ -103,6 +106,10 @@ class DomainCreate(BaseModel):
     code_group_id: int | None = None
 
 
+class DomainBulkRequest(BaseModel):
+    items: list["DomainCreate"]
+
+
 class DomainUpdate(BaseModel):
     domain_name: str | None = None
     domain_group: str | None = None
@@ -145,6 +152,10 @@ class TermCreate(BaseModel):
     domain_id: int | None = None
     description: str | None = None
     created_by: str | None = None
+
+
+class TermBulkRequest(BaseModel):
+    items: list["TermCreate"]
 
 
 class TermUpdate(BaseModel):
@@ -194,6 +205,15 @@ class CodeGroupCreate(BaseModel):
     group_name: str = Field(..., min_length=1, max_length=200)
     group_english: str | None = None
     description: str | None = None
+
+
+class CodeGroupBulkItem(CodeGroupCreate):
+    """벌크 적재용 코드그룹 — 코드값을 함께 중첩 적재."""
+    values: list["CodeValueCreate"] = Field(default_factory=list)
+
+
+class CodeGroupBulkRequest(BaseModel):
+    items: list[CodeGroupBulkItem]
 
 
 class CodeGroupUpdate(BaseModel):
@@ -323,3 +343,26 @@ class AutoMapResult(BaseModel):
     similar: int = 0
     violation: int = 0
     unmapped: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Bulk load (단건 → 벌크 적재)
+# ---------------------------------------------------------------------------
+
+class BulkError(BaseModel):
+    """벌크 적재 중 실패한 개별 행."""
+    index: int                               # 입력 배열에서의 위치 (0-based)
+    error: str                               # 실패 사유
+
+
+class BulkResult(BaseModel):
+    """벌크 적재 결과. 부분 성공을 허용하고 행별 실패를 보고한다."""
+    total: int = 0                           # 입력 행 수
+    created: int = 0                         # 성공 적재 수
+    failed: int = 0                          # 실패 수
+    ids: list[int] = Field(default_factory=list)       # 생성된 엔티티 id
+    errors: list[BulkError] = Field(default_factory=list)
+
+
+# Resolve forward reference to CodeValueCreate (defined above) for nested bulk item.
+CodeGroupBulkItem.model_rebuild()
