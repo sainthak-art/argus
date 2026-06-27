@@ -20,7 +20,7 @@ import {
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@workspace/ui/components/table"
-import { Plus, Trash2, Search, BookOpen, Type, Grid3X3, FileCode, Hash, ArrowRight } from "lucide-react"
+import { Plus, Trash2, Search, BookOpen, Type, Grid3X3, FileCode, Hash, ArrowRight, Upload } from "lucide-react"
 import { authFetch } from "@/features/auth/auth-fetch"
 
 const BASE = "/api/v1/standards"
@@ -66,6 +66,86 @@ type MorphemeResult = {
 type ComplianceStats = {
   total_columns: number; matched: number; similar: number; violation: number
   unmapped: number; compliance_rate: number
+}
+
+type BulkResult = {
+  total: number; created: number; failed: number
+  ids: number[]; errors: { index: number; error: string }[]
+}
+
+// ---------------------------------------------------------------------------
+// Bulk import button (CSV/XLSX → POST /import-file) — 단건 입력 보완
+// ---------------------------------------------------------------------------
+
+function ImportButton(
+  { kind, dictId, onImported }:
+  { kind: "word" | "domain" | "term" | "code"; dictId: number; onImported: () => void }
+) {
+  const inputRef = useRef<HTMLInputElement>(null)
+  const [busy, setBusy] = useState(false)
+  const [open, setOpen] = useState(false)
+  const [result, setResult] = useState<BulkResult | null>(null)
+
+  const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ""  // 같은 파일 재선택 허용
+    if (!file) return
+    setBusy(true)
+    const fd = new FormData()
+    fd.append("kind", kind)
+    fd.append("dictionary_id", String(dictId))
+    fd.append("file", file)
+    try {
+      const r = await authFetch(`${BASE}/import-file`, { method: "POST", body: fd })
+      if (r.ok) {
+        setResult(await r.json() as BulkResult)
+        onImported()
+      } else {
+        const txt = await r.text()
+        setResult({ total: 0, created: 0, failed: 0, ids: [], errors: [{ index: -1, error: `HTTP ${r.status}: ${txt}` }] })
+      }
+    } catch (err) {
+      setResult({ total: 0, created: 0, failed: 0, ids: [], errors: [{ index: -1, error: String(err) }] })
+    } finally {
+      setBusy(false)
+      setOpen(true)
+    }
+  }
+
+  return (
+    <>
+      <input ref={inputRef} type="file" accept=".csv,.xlsx" className="hidden" onChange={onFile} />
+      <Button variant="outline" size="sm" disabled={busy} onClick={() => inputRef.current?.click()}>
+        <Upload className="h-3.5 w-3.5 mr-1" />{busy ? "Importing..." : "Import"}
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader><DialogTitle>Import result</DialogTitle></DialogHeader>
+          {result && (
+            <div className="space-y-2 text-sm">
+              <div className="flex gap-4">
+                <span>Total: <b>{result.total}</b></span>
+                <span className="text-green-600">Created: <b>{result.created}</b></span>
+                <span className={result.failed ? "text-red-600" : undefined}>Failed: <b>{result.failed}</b></span>
+              </div>
+              {result.errors.length > 0 && (
+                <div className="max-h-60 overflow-auto rounded border p-2 font-mono text-xs space-y-1">
+                  {result.errors.map((er, i) => (
+                    <div key={i} className="text-red-600">
+                      {er.index >= 0 ? `row ${er.index}: ` : ""}{er.error}
+                    </div>
+                  ))}
+                </div>
+              )}
+              <p className="text-xs text-muted-foreground">
+                헤더 행 필요 — 예: 단어명/영문명/영문약어 · 도메인명/데이터유형/길이 · 용어명/영문명 · 코드그룹/코드값/코드값명
+              </p>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -369,9 +449,12 @@ function WordsTab({ dictId }: { dictId: number }) {
     <div className="flex flex-col flex-1 min-h-0 h-full">
       <div className="flex items-center justify-between mb-3 flex-shrink-0">
         <p className="text-sm text-muted-foreground">{words.length} words</p>
-        <Button variant="outline" size="sm" onClick={addWord}>
-          <Plus className="h-3.5 w-3.5 mr-1" />Add
-        </Button>
+        <div className="flex items-center gap-2">
+          <ImportButton kind="word" dictId={dictId} onImported={fetchWords} />
+          <Button variant="outline" size="sm" onClick={addWord}>
+            <Plus className="h-3.5 w-3.5 mr-1" />Add
+          </Button>
+        </div>
       </div>
       <div
         className="ag-theme-alpine flex-1 min-h-0"
@@ -482,7 +565,10 @@ function DomainsTab({ dictId }: { dictId: number }) {
     <div className="flex flex-col flex-1 min-h-0 h-full">
       <div className="flex items-center justify-between mb-3 flex-shrink-0">
         <p className="text-sm text-muted-foreground">{domains.length} domains</p>
-        <Button variant="outline" size="sm" onClick={addDomain}><Plus className="h-3.5 w-3.5 mr-1" />Add</Button>
+        <div className="flex items-center gap-2">
+          <ImportButton kind="domain" dictId={dictId} onImported={fetchDomains} />
+          <Button variant="outline" size="sm" onClick={addDomain}><Plus className="h-3.5 w-3.5 mr-1" />Add</Button>
+        </div>
       </div>
       <div className="ag-theme-alpine flex-1 min-h-0" style={{ "--ag-font-family": "var(--font-d2coding), 'D2Coding', Consolas, monospace", "--ag-font-size": "13px" } as React.CSSProperties}>
         <AgGridReact ref={gridRef} columnDefs={columnDefs} rowData={domains}
@@ -600,9 +686,12 @@ function TermsTab({ dictId }: { dictId: number }) {
           <Input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search terms..." className="h-8 pl-8 text-xs" />
         </div>
         <p className="text-sm text-muted-foreground">{terms.length} terms</p>
-        <Button variant="outline" size="sm" onClick={() => { setAddOpen(true); setTermName(""); setAnalysis(null) }}>
-          <Plus className="h-3.5 w-3.5 mr-1" />Add
-        </Button>
+        <div className="flex items-center gap-2">
+          <ImportButton kind="term" dictId={dictId} onImported={fetchTerms} />
+          <Button variant="outline" size="sm" onClick={() => { setAddOpen(true); setTermName(""); setAnalysis(null) }}>
+            <Plus className="h-3.5 w-3.5 mr-1" />Add
+          </Button>
+        </div>
       </div>
       <div className="ag-theme-alpine flex-1 min-h-0" style={{ "--ag-font-family": "var(--font-d2coding), 'D2Coding', Consolas, monospace", "--ag-font-size": "13px" } as React.CSSProperties}>
         <AgGridReact columnDefs={columnDefs} rowData={terms}
@@ -826,9 +915,12 @@ function CodesTab({ dictId }: { dictId: number }) {
         <div className="flex flex-col w-2/5 min-h-0">
           <div className="flex items-center justify-between mb-2 flex-shrink-0">
             <span className="text-sm font-medium text-muted-foreground">Code Groups</span>
-            <Button variant="outline" size="sm" onClick={addGroup}>
-              <Plus className="h-3.5 w-3.5 mr-1" />Add
-            </Button>
+            <div className="flex items-center gap-2">
+              <ImportButton kind="code" dictId={dictId} onImported={() => { fetchGroups(); fetchValues() }} />
+              <Button variant="outline" size="sm" onClick={addGroup}>
+                <Plus className="h-3.5 w-3.5 mr-1" />Add
+              </Button>
+            </div>
           </div>
           <div className="ag-theme-alpine flex-1 min-h-0" style={{
             "--ag-font-family": "var(--font-d2coding), 'D2Coding', Consolas, monospace",
